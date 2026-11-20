@@ -18,6 +18,15 @@ var (
 	// ErrMaxElapsedTime is the cause when retrying stops because
 	// [WithMaxElapsedTime] was reached.
 	ErrMaxElapsedTime = errors.New("backoff: maximum elapsed time exceeded")
+
+	// ErrBudgetExhausted is the cause when retrying stops because the shared
+	// [Budget] attached with [WithBudget] ran out of attempts or passed its
+	// deadline.
+	ErrBudgetExhausted = errors.New("backoff: retry budget exhausted")
+
+	// ErrBudgetClosed is the cause when retrying stops because the shared
+	// [Budget] attached with [WithBudget] was closed.
+	ErrBudgetClosed = errors.New("backoff: retry budget closed")
 )
 
 // RetryError is the error returned by [Retry] for every failure. It records the
@@ -55,12 +64,20 @@ type RetryError struct {
 
 // Error returns a single-line representation of the cause and last error.
 func (e *RetryError) Error() string {
+	if e.LastErr == nil {
+		// The budget can stop Retry before the first attempt, leaving no
+		// operation error to report.
+		return e.Cause.Error()
+	}
 	return fmt.Sprintf("%s (last error: %s)", e.Cause, e.LastErr)
 }
 
 // Unwrap returns the cause and the last operation error so both can be
 // matched with [errors.Is] and [errors.As].
 func (e *RetryError) Unwrap() []error {
+	if e.LastErr == nil {
+		return []error{e.Cause}
+	}
 	return []error{e.Cause, e.LastErr}
 }
 

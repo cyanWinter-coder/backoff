@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Budget` shares a retry budget across a group of concurrent `Retry` calls: a pooled attempt limit (`WithBudgetMaxTries`), a shared deadline (`WithBudgetMaxElapsedTime`/`WithBudgetDeadline`), and a group-wide concurrency limit (`WithBudgetMaxConcurrent`) whose slots are held only while an operation runs, never during the backoff wait. Attach one with the new `WithBudget` retry option. Attempt grants are atomic, `Budget.Close` wakes every waiter and refuses new attempts, and budget stops are reported as the new `ErrBudgetExhausted` / `ErrBudgetClosed` causes.
+
 ## [7.0.3] - 2026-11-01
 
 ### Fixed

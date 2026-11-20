@@ -27,6 +27,7 @@ type retryOptions struct {
 	Notify         Notify        // Optional function called before each backoff wait.
 	MaxTries       uint          // Maximum number of retry attempts.
 	MaxElapsedTime time.Duration // Maximum total time for all retries.
+	Budget         *Budget       // Optional shared budget gating each attempt.
 }
 
 // RetryOption configures the behavior of [Retry].
@@ -111,6 +112,10 @@ func WithMaxElapsedTime(d time.Duration) RetryOption {
 // context, so capture ctx inside the operation if you want cancellation to
 // abort an in-flight attempt. To bound only how long backoff keeps retrying,
 // without affecting in-flight attempts, use [WithMaxElapsedTime] instead.
+//
+// To share attempt, deadline, or concurrency limits across a group of
+// concurrent Retry calls — so one failure storm cannot multiply the pause
+// window by the number of callers — attach a [Budget] with [WithBudget].
 func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOption) (T, error) {
 	// Initialize default retry options.
 	args := &retryOptions{
@@ -128,9 +133,42 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 
 	startedAt := time.Now()
 	args.BackOff.Reset()
+
+	// A nil channel blocks forever in select, so the budget's close signal
+	// joins the wait below only when a budget is attached.
+	var budgetDone <-chan struct{}
+	if args.Budget != nil {
+		budgetDone = args.Budget.Done()
+	}
+
+	var res T
+	var lastErr error
 	for numTries := uint(1); ; numTries++ {
+		// If a shared budget is attached, every attempt — including the first —
+		// must be granted by it. The grant atomically consumes one shared try
+		// and holds a concurrency slot; a refusal stops this Retry with the
+		// budget's cause and whatever the last operation error was (nil if no
+		// attempt has run yet).
+		var permit *budgetPermit
+		if args.Budget != nil {
+			p, berr := args.Budget.acquire(ctx)
+			if berr != nil {
+				return res, &RetryError{LastErr: lastErr, Cause: berr}
+			}
+			permit = p
+		}
+
 		// Execute the operation.
-		res, err := operation()
+		var err error
+		res, err = operation()
+
+		// Release the concurrency slot before any wait: backing off must not
+		// hold a slot other group members could use. The consumed try is not
+		// refunded — the attempt happened.
+		if permit != nil {
+			permit.release()
+		}
+
 		if err == nil {
 			return res, nil
 		}
@@ -146,7 +184,7 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 		// LastErr should retrying stop (mirrors how a permanent error surfaces its
 		// inner error). errors.As matches it whether returned directly or wrapped.
 		// A typed-nil *RetryAfterError also matches; treat it as a plain error.
-		lastErr := err
+		lastErr = err
 		var retryAfter *RetryAfterError
 		if errors.As(err, &retryAfter) && retryAfter != nil && retryAfter.err != nil {
 			lastErr = retryAfter.err
@@ -193,7 +231,8 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 			}
 		}
 
-		// Wait for the next backoff period or context cancellation.
+		// Wait for the next backoff period, context cancellation, or the
+		// shared budget closing.
 		args.Timer.Start(next)
 		select {
 		case <-args.Timer.C():
@@ -202,6 +241,8 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 			}
 		case <-ctx.Done():
 			return res, &RetryError{LastErr: lastErr, Cause: context.Cause(ctx)}
+		case <-budgetDone:
+			return res, &RetryError{LastErr: lastErr, Cause: ErrBudgetClosed}
 		}
 	}
 }
